@@ -1,0 +1,15 @@
+# Environnement virtuel
+.venv/
+venv/
+env/
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Dossiers d'outils
+.vscode/
+.idea/
+
+# Si tu as des fichiers de données très lourds, tu peux les ignorer aussi
+# data/
