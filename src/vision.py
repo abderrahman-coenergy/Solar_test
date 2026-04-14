@@ -31,6 +31,16 @@ Problème #3 — Format single fisheye non géré :
   droite.
   → Fix : détection automatique du format par comptage de pixels non noirs
     dans chaque moitié.
+
+Améliorations v2
+----------------
+  • MiDaS est le critère PRINCIPAL ; la couleur ne sert qu'à valider
+    (intersection), jamais à ajouter des pixels ciel absents de MiDaS.
+  • Quand MiDaS n'est pas disponible, la couleur reste le fallback complet.
+  • Seule la PLUS GRANDE composante connexe est conservée à l'intérieur
+    du disque (élimine les artefacts isolés).
+  • L'horizon final est lissé par convolution gaussienne circulaire pour
+    supprimer les pics résiduels.
 """
 
 from __future__ import annotations
@@ -251,6 +261,43 @@ def _sky_by_color(img_rgb: np.ndarray,
     return sky.astype(np.uint8) * 255
 
 
+def _keep_largest_component(mask: np.ndarray,
+                             disk_mask: np.ndarray) -> np.ndarray:
+    """
+    Conserve uniquement la plus grande composante connexe du masque
+    à l'intérieur du disque. Les composantes hors disque sont ignorées.
+
+    Args:
+        mask      : masque binaire uint8 (0/255)
+        disk_mask : masque booléen du disque fisheye
+
+    Returns:
+        Masque uint8 (0/255) ne contenant que la plus grande composante
+        connexe à l'intérieur du disque. Renvoie le masque inchangé si
+        cv2 n'est pas disponible ou si aucune composante n'est trouvée.
+    """
+    if cv2 is None:
+        return mask
+
+    # Restreindre l'analyse au disque uniquement
+    mask_in_disk = np.where(disk_mask, mask, 0).astype(np.uint8)
+
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask_in_disk, connectivity=8
+    )
+
+    if n_labels <= 1:
+        # Aucune composante (hors label 0 = fond)
+        return np.zeros_like(mask)
+
+    # stats[label, cv2.CC_STAT_AREA] ; label 0 = fond → on l'exclut
+    areas = stats[1:, cv2.CC_STAT_AREA]   # shape (n_labels-1,)
+    largest_label = int(np.argmax(areas)) + 1  # +1 car on a exclu le fond
+
+    result = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+    return result
+
+
 def mask_sky(
     image: np.ndarray,
     disk_cx: int | None = None,
@@ -267,11 +314,16 @@ def mask_sky(
     Pipeline :
         1. Détection du disque circulaire (si coordonnées non fournies)
         2. Masque hors-disque → forcé à 0 (non-ciel)
-        3. MiDaS sur le ROI du disque :
+        3. MiDaS sur le ROI du disque (CRITÈRE PRINCIPAL) :
                ciel = profondeur inverse FAIBLE (valeur normalisée < threshold)
                car MiDaS: grande valeur = proche, petite valeur = lointain/ciel
-        4. Fusion avec critère couleur (fallback robuste)
-        5. Nettoyage morphologique
+        4. Validation par couleur (INTERSECTION uniquement, pas d'ajout) :
+               un pixel ciel MiDaS est conservé seulement si la couleur
+               le confirme ; la couleur seule ne peut pas créer de ciel.
+               Si MiDaS n'est pas disponible, la couleur reste le fallback
+               complet (comportement identique à l'ancienne version).
+        5. Conservation de la plus grande composante connexe dans le disque
+        6. Nettoyage morphologique
 
     Args:
         image                  : array HxWx3 RGB (une moitié de l'image)
@@ -279,7 +331,8 @@ def mask_sky(
         device                 : 'cpu', 'cuda' ou None (auto)
         midas_depth_threshold  : seuil de profondeur inverse pour "ciel" (0-1).
                                  Valeur basse → critère plus strict.
-        use_color_fallback     : compléter MiDaS avec détection couleur
+        use_color_fallback     : utiliser la couleur comme validation de MiDaS
+                                 (ou comme fallback complet si MiDaS indisponible)
         morph_ksize            : taille du noyau pour morphologie
 
     Returns:
@@ -300,15 +353,15 @@ def mask_sky(
     roi = image[y0:y1, x0:x1]
 
     full_sky_mask = np.zeros((h, w), dtype=np.uint8)
+    midas_available = False
 
-    # ── 3. MiDaS (si disponible) ──────────────────────────────────────────────
+    # ── 3. MiDaS — critère principal ─────────────────────────────────────────
     if torch is not None and cv2 is not None:
         try:
             dev   = _select_device(device)
             depth = _run_midas(roi, dev)
 
             # FIX : ciel = profondeur inverse FAIBLE (objet lointain)
-            # On prend les pixels avec une profondeur normalisée < threshold
             sky_roi = (depth < midas_depth_threshold).astype(np.uint8) * 255
 
             # Remettre dans les dimensions de l'image complète
@@ -319,21 +372,33 @@ def mask_sky(
 
             # Forcer 0 hors du disque
             sky_full[~disk_mask] = 0
-            full_sky_mask = sky_full
+            full_sky_mask  = sky_full
+            midas_available = True
 
         except Exception as e:
             log.warning(f"MiDaS échoué ({e}) — passage au fallback couleur.")
-            full_sky_mask = np.zeros((h, w), dtype=np.uint8)
+            full_sky_mask  = np.zeros((h, w), dtype=np.uint8)
+            midas_available = False
 
-    # ── 4. Fusion avec critère couleur ────────────────────────────────────────
+    # ── 4. Couleur : validation (si MiDaS OK) ou fallback complet ────────────
     if use_color_fallback:
         color_mask = _sky_by_color(image, disk_mask)
-        # Union : un pixel est ciel s'il est détecté par l'un OU l'autre
-        full_sky_mask = np.where(
-            (full_sky_mask > 0) | (color_mask > 0), 255, 0
-        ).astype(np.uint8)
 
-    # ── 5. Nettoyage morphologique ────────────────────────────────────────────
+        if midas_available:
+            # VALIDATION : conserver seulement ce que les deux approches
+            # confirment (intersection). La couleur ne peut pas AJOUTER
+            # de pixels ciel absents du masque MiDaS.
+            full_sky_mask = np.where(
+                (full_sky_mask > 0) & (color_mask > 0), 255, 0
+            ).astype(np.uint8)
+        else:
+            # FALLBACK : MiDaS absent → la couleur est le seul critère
+            full_sky_mask = color_mask
+
+    # ── 5. Plus grande composante connexe dans le disque ─────────────────────
+    full_sky_mask = _keep_largest_component(full_sky_mask, disk_mask)
+
+    # ── 6. Nettoyage morphologique ────────────────────────────────────────────
     if cv2 is not None and morph_ksize > 0:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (morph_ksize, morph_ksize)
@@ -616,12 +681,63 @@ def _ensure_uint8_mask(mask: np.ndarray) -> np.ndarray:
     return mask
 
 
+def _smooth_horizon_circular(horizon_rad: np.ndarray,
+                              sigma_deg: float = 3.0) -> np.ndarray:
+    """
+    Lisse le profil d'horizon par convolution gaussienne circulaire.
+
+    La circularité est gérée en répliquant le signal aux deux extrémités
+    avant convolution, ce qui évite les artefacts de bord entre les
+    azimuts 0° et 360°.
+
+    Args:
+        horizon_rad : tableau 1D de 360 valeurs (élévation en radians)
+        sigma_deg   : écart-type de la gaussienne en degrés (1 bin = 1°)
+
+    Returns:
+        Tableau lissé de même forme.
+    """
+    n = len(horizon_rad)
+    sigma_bins = max(sigma_deg, 0.0)
+    if sigma_bins < 1e-6:
+        return horizon_rad.copy()
+
+    # Largeur du noyau : ±3σ arrondi au bin impair le plus proche
+    half_k = int(np.ceil(3.0 * sigma_bins))
+    k_size = 2 * half_k + 1
+
+    # Noyau gaussien normalisé
+    x      = np.arange(-half_k, half_k + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (x / sigma_bins) ** 2)
+    kernel /= kernel.sum()
+
+    # Réplication circulaire : pad de taille half_k des deux côtés
+    padded = np.concatenate([
+        horizon_rad[-half_k:],
+        horizon_rad,
+        horizon_rad[:half_k],
+    ])
+
+    # Convolution 1D avec le noyau gaussien
+    smoothed = np.convolve(padded, kernel, mode='valid')
+
+    # mode='valid' retourne exactement n valeurs quand len(padded) = n + k_size - 1
+    # et len(kernel) = k_size
+    assert smoothed.shape[0] == n, (
+        f"Erreur de lissage : {smoothed.shape[0]} valeurs au lieu de {n}."
+    )
+
+    return np.clip(smoothed, 0.0, np.pi / 2.0)
+
+
 def get_horizon_from_sphere(eq: Equirectangular) -> np.ndarray:
     """
     Extrait le profil d'horizon depuis une Equirectangular (masque binaire).
 
     Pour chaque colonne (= azimut), cherche la frontière ciel/sol dans la
     demi-sphère supérieure et la convertit en élévation angulaire (radians).
+    Le profil brut est ensuite lissé par convolution gaussienne circulaire
+    pour supprimer les pics résiduels.
 
     Returns:
         np.ndarray de 360 valeurs — élévation de l'horizon en radians.
@@ -655,6 +771,9 @@ def get_horizon_from_sphere(eq: Equirectangular) -> np.ndarray:
         idx = np.round(np.linspace(0, len(horizon_rad) - 1, 360)).astype(int)
         horizon_rad = horizon_rad[idx]
 
+    # Lissage gaussien circulaire pour supprimer les pics résiduels
+    horizon_rad = _smooth_horizon_circular(horizon_rad, sigma_deg=3.0)
+
     return np.clip(horizon_rad, 0.0, np.pi / 2.0)
 
 
@@ -679,10 +798,11 @@ def compute_horizon_from_image(
     Étapes :
         1. Chargement + détection du format
         2. Détection du/des disque(s) circulaire(s)
-        3. Masquage du ciel (MiDaS + couleur, corrigé)
+        3. Masquage du ciel (MiDaS principal + couleur en validation,
+           plus grande composante connexe conservée)
         4. Projection équirectangulaire
         5. Rotation selon azimut et inclinaison de la caméra
-        6. Extraction du profil d'horizon
+        6. Extraction du profil d'horizon (avec lissage gaussien circulaire)
 
     Args:
         image_path      : chemin vers l'image fisheye
