@@ -667,7 +667,7 @@ def compute_horizon_from_image(
     fov_deg: int = 180,
     single_half: Optional[str] = None,
     azimuth_deg: float = 0.0,
-    inclination_deg: float = 90.0,
+    inclination_deg: float = 0.0,
     preview: bool = False,
     device: Optional[str] = None,
 ) -> np.ndarray:
