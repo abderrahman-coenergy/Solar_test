@@ -290,7 +290,7 @@ def fit_3d(
         (kd_opt, f1_opt, f2_opt, residual_error)
     """
     bounds = [
-        (0.0,                   1.0),
+        (SOLVER_CFG.kd_min,  SOLVER_CFG.f1_max),
         (SOLVER_CFG.f1_min,  SOLVER_CFG.f1_max),
         (SOLVER_CFG.f2_min,  SOLVER_CFG.f2_max),
     ]

@@ -120,15 +120,6 @@ SOLVER_CFG = SolverConfig(
     f2_max   =  0.5,
 )
 
-# Aliases module-level pour la compatibilité avec l'ancien code (import direct)
-KD_GRID_MIN   = SOLVER_CFG.kd_min
-KD_GRID_MAX   = SOLVER_CFG.kd_max
-KD_GRID_STEPS = SOLVER_CFG.kd_steps
-F1_MIN = SOLVER_CFG.f1_min
-F1_MAX = SOLVER_CFG.f1_max
-F2_MIN = SOLVER_CFG.f2_min
-F2_MAX = SOLVER_CFG.f2_max
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3. Constantes atmosphériques
@@ -155,21 +146,6 @@ ATM = AtmosphericDefaults(
     elevation_scale_height  = 8434.5,
     min_solar_elevation_rad = np.deg2rad(1.0),   # 1° au-dessus de l'horizon
 )
-
-# Aliases module-level
-ELEVATION_SCALE_HEIGHT   = ATM.elevation_scale_height
-MIN_SOLAR_ELEVATION_RAD  = ATM.min_solar_elevation_rad
-KAPPA                    = PEREZ.kappa
-
-# Aliases pour les tables Perez (compatibilité)
-tabF11 = PEREZ.tabF11
-tabF12 = PEREZ.tabF12
-tabF13 = PEREZ.tabF13
-tabF21 = PEREZ.tabF21
-tabF22 = PEREZ.tabF22
-tabF23 = PEREZ.tabF23
-bin_epsilon_0 = PEREZ.bin_epsilon_0
-bin_epsilon_1 = PEREZ.bin_epsilon_1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
